@@ -1,0 +1,99 @@
+name: Build aarch64 wheel
+
+# Builds a linux/aarch64 wheel for a PyPI project that doesn't publish one,
+# natively on GitHub's arm64 runner, and attaches it to a GitHub Release
+# tagged <project>-<version>. Consumers pin the release asset by URL + hash.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: PyPI project to build (e.g. arm-pyart)
+        required: true
+        default: arm-pyart
+      version:
+        description: Version to build (e.g. 2.2.0)
+        required: true
+      python:
+        description: CPython version to build for; must match the consuming image
+        required: true
+        default: "3.11"
+      import_name:
+        description: Module the smoke test imports (e.g. pyart)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ inputs.project }} ${{ inputs.version }} (py${{ inputs.python }}, aarch64)
+    runs-on: ubuntu-24.04-arm
+    env:
+      PROJECT: ${{ inputs.project }}
+      VERSION: ${{ inputs.version }}
+      PYTHON: ${{ inputs.python }}
+      IMPORT_NAME: ${{ inputs.import_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python }}
+
+      - name: Fetch sdist from PyPI
+        id: sdist
+        run: python scripts/fetch_sdist.py "$PROJECT" "$VERSION" sdist
+
+      - name: Select build
+        id: select
+        run: echo "build=cp${PYTHON/./}-manylinux_aarch64" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel
+        uses: pypa/cibuildwheel@v4.2.1
+        with:
+          package-dir: ${{ steps.sdist.outputs.path }}
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: ${{ steps.select.outputs.build }}
+          CIBW_ARCHS_LINUX: aarch64
+          # Projects' own test suites tend to fetch data from the network;
+          # the smoke test below checks the wheel itself.
+          CIBW_TEST_SKIP: "*"
+
+      - name: Smoke test
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install wheelhouse/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/python" "$GITHUB_WORKSPACE/scripts/smoke_test.py" "$IMPORT_NAME"
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SDIST_PATH: ${{ steps.sdist.outputs.path }}
+          SDIST_SHA256: ${{ steps.sdist.outputs.sha256 }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          tag="${PROJECT}-${VERSION}"
+          cd wheelhouse
+          {
+            echo "linux/aarch64 build of [${PROJECT} ${VERSION}](https://pypi.org/project/${PROJECT}/${VERSION}/) from its PyPI sdist."
+            echo
+            echo "- sdist: \`$(basename "$SDIST_PATH")\` sha256 \`${SDIST_SHA256}\`"
+            echo "- built by: ${RUN_URL}"
+            echo
+            echo '```'
+            sha256sum *.whl
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+          # Published wheels are immutable: consumers pin them by hash, so
+          # uploading never overwrites an existing asset (it fails instead).
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" *.whl
+          else
+            gh release create "$tag" *.whl --title "${PROJECT} ${VERSION} (aarch64)" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
